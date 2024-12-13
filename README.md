@@ -1,4 +1,5 @@
 <h1 style="font-size: 3em;">SDformer: Similarity-driven Discrete Transformer For Time Series Generation</h1>
+[SDformer: Similarity-driven Discrete Transformer For Time Series Generation](https://openreview.net/forum?id=ZKbplMrDzI)
 
 # Usage
 ## Install the environment using yaml file
