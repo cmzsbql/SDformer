@@ -18,6 +18,7 @@ def discriminative_score_metrics (ori_data, generated_data):
   ori_data = np.array(ori_data)
   # Initialization on the Graph
   tf.compat.v1.reset_default_graph()
+  tf.config.set_visible_devices([], 'GPU')
 
   # Basic Parameters
   no, seq_len, dim = np.asarray(ori_data).shape    
