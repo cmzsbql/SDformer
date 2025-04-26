@@ -2,6 +2,8 @@ import os
 import numpy as np
 import json
 import torch
+import torch.optim as optim
+from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 import options.option_transformer as option_trans
 import models.vqvae as vqvae
@@ -15,43 +17,23 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import time
-import fire
-import deepspeed
-from deepspeed.accelerator import get_accelerator
 import random
-def is_rank_0() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
 
-import torch
-from torch.distributions import Categorical
-
-def train(local_rank: int = -1):
-    world_size = torch.cuda.device_count()
-    print("world_size:",world_size)
-    device = (torch.device(get_accelerator().device_name(), local_rank) if (local_rank > -1)
-              and get_accelerator().is_available() else torch.device("cpu"))
-    print(device)
+def train():
     ##### ---- Exp dirs ---- #####
     args = option_trans.get_args_parser()
-
-    args.total_iter = args.total_iter/world_size
-    args.print_iter = args.print_iter/world_size
-    args.eval_iter = args.eval_iter/world_size
-
-    args.lr_scheduler = [int(x / world_size) for x in args.lr_scheduler]
-    print(args.total_iter,args.print_iter)
-    print(args.lr_scheduler)
-    torch.manual_seed(args.seed + local_rank)
-    if is_rank_0():
-        args.out_dir = os.path.join(args.out_dir, f'{args.exp_name}')
-        os.makedirs(args.out_dir, exist_ok=True)
-        ##### ---- Dataloader ---- #####
-        train_loader_token = dataset_VQ.DATALoader(args.dataname,
-                                             64,
+    torch.manual_seed(args.seed)
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    print("gpu",args.gpu)
+    args.out_dir = os.path.join(args.out_dir, f'{args.exp_name}')
+    os.makedirs(args.out_dir, exist_ok=True)
+    ##### ---- Dataloader ---- #####
+    train_loader_token = dataset_VQ.DATALoader(args.dataname,
+                                             64,#1024 for comparison,#64
                                              window_size=args.window_size,
                                              unit_length=2 ** args.down_t, dataset_type='train')
 
-        net = vqvae.VQVAE(args,
+    net = vqvae.VQVAE(args,
                                args.nb_code,
                                args.code_dim,
                                args.down_t,
@@ -61,26 +43,24 @@ def train(local_rank: int = -1):
                                args.dilation_growth_rate,
                                args.vq_act,
                                args.vq_norm)
-        print ('loading checkpoint from {}'.format(args.resume_pth))
-        ckpt = torch.load(args.resume_pth, map_location='cpu')
-        net.load_state_dict(ckpt['net'], strict=True)
-        net.eval()
-        net = net.float()
-        net = net.to(device)
+    print ('loading checkpoint from {}'.format(args.resume_pth))
+    ckpt = torch.load(args.resume_pth, map_location='cpu')
+    net.load_state_dict(ckpt['net'], strict=True)
+    net.eval()
+    net = net.float()
+    net = net.cuda()
 
-        train_dataset = []
-        nb_used=set({})
-        ##### ---- get code ---- #####
-        for batch in tqdm(train_loader_token):
-            batch = batch.cuda().float()
-            target = net.encode(batch).cpu().numpy()
-            nb_used = nb_used.union(set(target.reshape(-1)))
-            train_dataset.append(target)
-        print("#####",target.shape,"######")
-        print("The number of used code:",len(nb_used))
-        train_dataset = np.concatenate(train_dataset, 0)
-        if world_size>1:
-            np.save("./train_dataset.npy",train_dataset)
+    train_dataset = []
+    nb_used=set({})
+    ##### ---- get code ---- #####
+    for batch in tqdm(train_loader_token):
+        batch = batch.cuda().float()
+        target = net.encode(batch).cpu().numpy()
+        nb_used = nb_used.union(set(target.reshape(-1)))
+        train_dataset.append(target)
+    print("#####",target.shape,"######")
+    print("The number of used code:",len(nb_used))
+    train_dataset = np.concatenate(train_dataset, 0)
 
     ##### ---- Logger ---- #####
     logger = utils_model.get_logger(args.out_dir)
@@ -89,26 +69,6 @@ def train(local_rank: int = -1):
 
 
     #### ---- Network ---- #####
-    ds_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": args.lr,
-                "weight_decay": args.weight_decay,
-                "betas": [0.5, 0.9],
-            }
-        },
-        "fp16": {
-            "enabled": False
-        },
-        "zero_optimization": {
-            "stage": 1,
-            "offload_optimizer": {
-                "device": "cpu"
-            }
-        },
-    }
     trans_encoder = trans.TSG_Transformer(num_vq=args.nb_code,
                                                   embed_dim=args.embed_dim_gpt,
                                                   block_size=args.block_size,
@@ -121,15 +81,15 @@ def train(local_rank: int = -1):
         ckpt = torch.load(args.resume_trans, map_location='cpu')
         trans_encoder.load_state_dict(ckpt['trans'], strict=True)
 
-    trans_encoder, optimizer, _, _ = deepspeed.initialize(model=trans_encoder,
-                                          model_parameters=trans_encoder.parameters(),
-                                          config=ds_config)
+    optimizer = optim.AdamW(
+        trans_encoder.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.5, 0.9)
+    )
+    trans_encoder=trans_encoder.cuda()
     trans_encoder.train()
 
-    torch.distributed.barrier()
-
-    if world_size > 1:
-        train_dataset = np.load("./train_dataset.npy")
     repeat_times=100
     from torch.utils.data import ConcatDataset
     train_dataset = [train_dataset for _ in range(repeat_times)]
@@ -150,21 +110,22 @@ def train(local_rank: int = -1):
     right_num = 0
     total_num = 0
 
-    ###---- Training ---- #####
-    if is_rank_0():
-        start_time = time.time()
-        best_iter_test, best_ds, writer, logger = eval_trans.evaluation_transformer(args,args.out_dir, train_loader_token, trans_encoder.module,
+    ###---- Evaluating ---- #####
+    start_time = time.time()
+    best_iter_test, best_ds, writer, logger = eval_trans.evaluation_transformer(args,args.out_dir, train_loader_token, trans_encoder,
                                                                                                net, logger, writer, 0,
                                                                                                best_iter=0,
                                                                                                best_ds=99999)
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        print(f"First evaluaion time: {elapsed_time} seconds")
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"First evaluaion time: {elapsed_time} seconds")
 
+
+    ###---- Training ---- #####
     intial_token_id = args.nb_code
     while nb_iter <= args.total_iter:
         batch = next(train_loader_iter)
-        batch = batch.to(device)
+        batch = batch.cuda()
         target = batch
         bs,len_t = target.shape
         input_index = batch.clone()
@@ -195,10 +156,10 @@ def train(local_rank: int = -1):
         total_num += target.shape[0]
         avg_loss_cls = avg_loss_cls + loss_cls.item()
 
-        ## global loss
-        trans_encoder.backward(loss_cls)
-        trans_encoder.step()
 
+        optimizer.zero_grad()
+        loss_cls.backward()
+        optimizer.step()
 
         nb_iter += 1
         if nb_iter % args.print_iter == 0 :
@@ -212,11 +173,11 @@ def train(local_rank: int = -1):
             right_num = 0
             total_num = 0
 
-        if nb_iter % args.eval_iter == 0 and is_rank_0() :
+        if nb_iter % args.eval_iter == 0:
             start_time = time.time()
             best_iter_test, best_ds, writer, logger = eval_trans.evaluation_transformer(args,args.out_dir,
                                                                                                     train_loader_token,
-                                                                                                    trans_encoder.module,
+                                                                                                    trans_encoder,
                                                                                                     net, logger, writer,
                                                                                                     nb_iter=nb_iter,
                                                                                                     best_iter=best_iter_test,
@@ -225,11 +186,11 @@ def train(local_rank: int = -1):
             elapsed_time = end_time - start_time
             print(f"evaluaion time: {elapsed_time} seconds")
 
-        if nb_iter == args.total_iter and is_rank_0():
+        if nb_iter == args.total_iter:
             msg_final2 = f"Train. Iter {best_iter_test} : , DS. {best_ds:.4f}"
             logger.info(msg_final2)
             exit()
 if __name__=="__main__":
-    fire.Fire(train)
+    train()
 
 
