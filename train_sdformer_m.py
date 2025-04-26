@@ -125,7 +125,7 @@ def train():
     mask_token_id = args.nb_code
     while nb_iter <= args.total_iter:
         batch = next(train_loader_iter)
-        batch = batch.to(device)
+        batch = batch.cuda()
         target = batch
         bs,len_t = target.shape
         input_index = batch.clone()
