@@ -67,5 +67,6 @@ def get_args_parser():
     parser.add_argument('--index', type=int, default=0, help='index')
 
     parser.add_argument("--if-test", action='store_true', help="test")
+    parser.add_argument('--gpu', type=str, default='0', help='gpu')
 
     return parser.parse_args()
