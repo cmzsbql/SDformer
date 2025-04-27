@@ -104,6 +104,11 @@ def evaluation_transformer(args,out_dir, val_loader, trans, net, logger, writer,
     labels = list(labels)
     pres = list(pres)
 
+    if args.if_test:
+        np.save(os.path.join(out_dir, 'labels_ds.npy'), np.stack(labels, axis=0))
+        np.save(os.path.join(out_dir, 'pres_ds.npy'), np.stack(pres, axis=0))
+        print("Generation Completed!")
+        exit()
 
     discriminative_score = list()
     for tt in range(5):#max_steps_metric
@@ -125,10 +130,6 @@ def evaluation_transformer(args,out_dir, val_loader, trans, net, logger, writer,
             torch.save({'trans': trans.state_dict()}, os.path.join(out_dir, 'net_best_ds.pth'))
             np.save(os.path.join(out_dir, 'labels_ds.npy'), np.stack(labels, axis=0))
             np.save(os.path.join(out_dir, 'pres_ds.npy'), np.stack(pres, axis=0))
-
-    if args.if_test:
-        print("Generation Completed!")
-        exit()
 
     trans.train()
     return best_iter, best_ds, writer, logger
